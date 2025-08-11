@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/csv"
 	"flag"
 	"fmt"
 	"os"
@@ -29,14 +30,6 @@ const (
 	podNamePrefix      = "test-pod"
 	podReplacePeriod   = 50 * time.Millisecond
 	podReplaceDuration = 60 * time.Second
-	kubeletProcessCmd  = "ps -ef | grep \"/kubelet\" | grep -v \"sudo\" | grep -v grep"
-)
-
-var (
-	cpuReadings   []float64
-	memReadings   []float64
-	maxCpuReading float64
-	dataMutex     sync.Mutex
 )
 
 func createPodObject(name string) *corev1.Pod {
@@ -94,7 +87,6 @@ func createAndWaitForPods(ctx context.Context, clientset *kubernetes.Clientset) 
 		default:
 		}
 
-		time.Sleep(time.Second * 2)
 		podName := fmt.Sprintf("%s-%d", podNamePrefix, i)
 		pod := createPodObject(podName)
 		_, err := clientset.CoreV1().Pods(namespace).Create(ctx, pod, metav1.CreateOptions{})
@@ -159,7 +151,7 @@ func waitForPodDeletion(ctx context.Context, clientset *kubernetes.Clientset, po
 func replacePods(ctx context.Context, clientset *kubernetes.Clientset) {
 	fmt.Printf("Starting pod replacement for %v...\n", podReplaceDuration)
 
-	podIndex := 600
+	podIndex := 1
 	ticker := time.NewTicker(podReplacePeriod)
 	defer ticker.Stop()
 
@@ -208,134 +200,112 @@ func replacePods(ctx context.Context, clientset *kubernetes.Clientset) {
 	}
 }
 
-func getKubeletProcessStats() (pid string, cpuPercent float64, memoryMB float64, err error) {
-	cmd := exec.Command("bash", "-c", kubeletProcessCmd)
-	output, err := cmd.Output()
-	if err != nil {
-		return "", 0, 0, fmt.Errorf("failed to find kubelet: %v", err)
-	}
-
-	scanner := bufio.NewScanner(bytes.NewReader(output))
-	if scanner.Scan() {
-		fields := strings.Fields(scanner.Text())
-		if len(fields) < 2 {
-			return "", 0, 0, fmt.Errorf("invalid ps output format")
-		}
-		pid = fields[1]
-	} else {
-		return "", 0, 0, fmt.Errorf("kubelet process not found")
-	}
-
-	psCpuCmd := exec.Command("ps", "-p", pid, "-o", "%cpu", "--no-headers")
-	psCpuOutput, err := psCpuCmd.Output()
-	if err != nil {
-		return pid, 0, 0, fmt.Errorf("failed to get CPU usage: %v", err)
-	}
-	cpuStr := strings.TrimSpace(string(psCpuOutput))
-	cpuPercent, err = strconv.ParseFloat(cpuStr, 64)
-	if err != nil {
-		return pid, 0, 0, fmt.Errorf("failed to parse CPU: %v", err)
-	}
-
-	psMemCmd := exec.Command("ps", "-p", pid, "-o", "rss", "--no-headers")
-	psMemOutput, err := psMemCmd.Output()
-	if err != nil {
-		return pid, cpuPercent, 0, fmt.Errorf("failed to get memory usage: %v", err)
-	}
-	memRssStr := strings.TrimSpace(string(psMemOutput))
-	rssKB, err := strconv.ParseFloat(memRssStr, 64)
-	if err != nil {
-		return pid, cpuPercent, 0, fmt.Errorf("failed to parse memory: %v", err)
-	}
-	memoryMB = rssKB / 1024.0
-
-	return pid, cpuPercent, memoryMB, nil
-}
-
-func getKubeletInstantaneousCPU(pid string) (float64, error) {
-	if pid == "" {
-		return 0, fmt.Errorf("PID is empty, cannot get instantaneous CPU")
-	}
-	topCmd := exec.Command("top", "-b", "-n", "1", "-p", pid)
-	topOutput, err := topCmd.Output()
-	if err != nil {
-		return 0, fmt.Errorf("failed to get stats from top for pid %s: %v", pid, err)
-	}
-
-	scanner := bufio.NewScanner(bytes.NewReader(topOutput))
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if strings.HasPrefix(line, pid) {
-			fields := strings.Fields(line)
-			if len(fields) >= 9 {
-				cpuStr := fields[8]
-				cpuPercent, err := strconv.ParseFloat(cpuStr, 64)
-				if err != nil {
-					return 0, fmt.Errorf("failed to parse CPU from top output: %v", err)
-				}
-				return cpuPercent, nil
-			}
-		}
-	}
-
-	return 0, fmt.Errorf("could not find process stats in top output for pid %s", pid)
-}
-
-func monitorKubeletResources(ctx context.Context, wg *sync.WaitGroup) {
+func monitorResources(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
-	fmt.Println("Starting kubelet resource monitoring...")
+	fmt.Println("Starting resource monitoring...")
 
-	ticker := time.NewTicker(100 * time.Millisecond)
+	kubeletFile, err := os.Create("kubelet_usage.csv")
+	if err != nil {
+		fmt.Printf("Error creating kubelet_usage.csv: %v\n", err)
+		return
+	}
+	defer kubeletFile.Close()
+	kubeletWriter := csv.NewWriter(kubeletFile)
+	defer kubeletWriter.Flush()
+
+	containerdFile, err := os.Create("containerd_usage.csv")
+	if err != nil {
+		fmt.Printf("Error creating containerd_usage.csv: %v\n", err)
+		return
+	}
+	defer containerdFile.Close()
+	containerdWriter := csv.NewWriter(containerdFile)
+	defer containerdWriter.Flush()
+
+	header := []string{"timestamp", "cpu_usage", "memory_usage_kb"}
+	kubeletWriter.Write(header)
+	containerdWriter.Write(header)
+
+	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			fmt.Println("Stopping kubelet resource monitoring.")
+			fmt.Println("Stopping resource monitoring.")
 			return
 		case <-ticker.C:
-			if ctx.Err() != nil {
+			timestamp := time.Now().Format(time.RFC3339)
+
+			// Monitor kubelet using top
+			cmdTop := exec.Command("top", "-b", "-n", "1", "-u", "root")
+			outputTop, err := cmdTop.Output()
+			if err != nil {
+				fmt.Printf("Error getting stats from top: %v\n", err)
+			} else {
+				scanner := bufio.NewScanner(bytes.NewReader(outputTop))
+				for scanner.Scan() {
+					line := scanner.Text()
+					fields := strings.Fields(line)
+					if len(fields) < 12 {
+						continue
+					}
+					processName := fields[11]
+					if strings.Contains(processName, "kubelet") {
+						cpu := fields[8]  // %CPU
+						mem := fields[5]  // RES in KB
+						rowData := []string{timestamp, cpu, mem}
+						if err := kubeletWriter.Write(rowData); err != nil {
+							fmt.Printf("Error writing to kubelet_usage.csv: %v\n", err)
+						}
+						break // Assume only one kubelet process
+					}
+				}
+			}
+
+			// Monitor containerd using pidstat
+			pidCmd := exec.Command("pgrep", "-x", "containerd")
+			pidOutput, err := pidCmd.Output()
+			if err != nil {
+				fmt.Printf("Error finding containerd PID: %v\n", err)
 				continue
 			}
-			pid, avgCpu, mem, err := getKubeletProcessStats()
-			if err != nil && ctx.Err() == nil {
-				fmt.Printf("Error getting kubelet stats (ps): %v\n", err)
+			pid := strings.TrimSpace(string(pidOutput))
+			if pid == "" {
+				fmt.Println("containerd process not found")
 				continue
 			}
 
-			instCpu, err := getKubeletInstantaneousCPU(pid)
-			if err != nil && ctx.Err() == nil {
-				fmt.Printf("Error getting kubelet instantaneous CPU (top): %v\n", err)
-				instCpu = avgCpu
+			pidstatCmd := exec.Command("pidstat", "-p", pid, "-ru", "-h", "1", "1")
+			pidstatOutput, err := pidstatCmd.Output()
+			if err != nil {
+				fmt.Printf("Error getting stats from pidstat: %v\n", err)
+				continue
 			}
 
-			dataMutex.Lock()
-			cpuReadings = append(cpuReadings, avgCpu)
-			memReadings = append(memReadings, mem)
-			if instCpu > maxCpuReading {
-				maxCpuReading = instCpu
+			pidstatScanner := bufio.NewScanner(bytes.NewReader(pidstatOutput))
+			var cpu, mem string
+			for pidstatScanner.Scan() {
+				line := pidstatScanner.Text()
+				if strings.Contains(line, "Average") || !strings.Contains(line, pid) {
+					continue
+				}
+				fields := strings.Fields(line)
+				if len(fields) >= 13 {
+					cpu = fields[7]
+					mem = fields[12] // RSS column for memory in KB
+					rowData := []string{timestamp, cpu, mem}
+					if err := containerdWriter.Write(rowData); err != nil {
+						fmt.Printf("Error writing to containerd_usage.csv: %v\n", err)
+					}
+					break
+				}
 			}
-			dataMutex.Unlock()
-			if ctx.Err() == nil {
-				fmt.Printf("Kubelet PID: %s, CPU (ps-avg): %.2f%%, CPU (top-inst): %.2f%%, Memory: %.2fMB\n", pid, avgCpu, instCpu, mem)
-			}
+
+			kubeletWriter.Flush()
+			containerdWriter.Flush()
 		}
 	}
-}
-
-func writeAveragesToFile(cpuAvg, memAvg, cpuMax float64) error {
-	file, err := os.Create("resource_averages.txt")
-	if err != nil {
-		return fmt.Errorf("failed to create file: %v", err)
-	}
-	defer file.Close()
-
-	content := fmt.Sprintf("Average CPU Usage (from ps): %.2f%%\nMaximum Instantaneous CPU Usage (from top): %.2f%%\nAverage Memory Usage (RSS): %.2fMB\n", cpuAvg, cpuMax, memAvg)
-	_, err = file.WriteString(content)
-	if err != nil {
-		return fmt.Errorf("failed to write to file: %v", err)
-	}
-	return nil
 }
 
 var (
@@ -371,7 +341,7 @@ func main() {
 	var monitorWg sync.WaitGroup
 	monitorCtx, monitorCancel := context.WithCancel(context.Background())
 	monitorWg.Add(1)
-	go monitorKubeletResources(monitorCtx, &monitorWg)
+	go monitorResources(monitorCtx, &monitorWg)
 
 	if *createPods {
 		podsCreationDuration, err := createAndWaitForPods(ctx, clientset)
@@ -383,8 +353,7 @@ func main() {
 			}
 			os.Exit(1)
 		}
-		fmt.Printf("Initial pods ready in %v.", podsCreationDuration)
-		monitorCancel()
+		fmt.Printf("Initial pods ready in %v.\n", podsCreationDuration)
 	}
 
 	if *stressTest {
@@ -395,36 +364,10 @@ func main() {
 
 		<-replaceCtx.Done()
 		fmt.Printf("Pod replacement ran for %v.\n", podReplaceDuration)
-
-		monitorCancel()
 	}
 
+	monitorCancel()
 	monitorWg.Wait()
 
-	dataMutex.Lock()
-	var cpuAvg, memAvg, cpuMax float64
-	cpuMax = maxCpuReading
-	if len(cpuReadings) > 0 {
-		var totalCpu float64
-		for _, cpu := range cpuReadings {
-			totalCpu += cpu
-		}
-		cpuAvg = totalCpu / float64(len(cpuReadings))
-	}
-	if len(memReadings) > 0 {
-		var totalMem float64
-		for _, mem := range memReadings {
-			totalMem += mem
-		}
-		memAvg = totalMem / float64(len(memReadings))
-	}
-	dataMutex.Unlock()
-
-	if err := writeAveragesToFile(cpuAvg, memAvg, cpuMax); err != nil {
-		fmt.Printf("Failed to write averages to file: %v\n", err)
-	} else {
-		fmt.Printf("Wrote stats to resource_averages.txt: CPU Avg (ps) %.2f%%, CPU Max (top) %.2f%%, Memory Avg %.2fMB\n", cpuAvg, cpuMax, memAvg)
-	}
-
-	fmt.Println("Test completed.")
+	fmt.Println("Test completed. Data saved to kubelet_usage.csv and containerd_usage.csv")
 }
